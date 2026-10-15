@@ -94,13 +94,19 @@ class OrdersProducer(exchanges_channel.ExchangeChannelProducer):
 
     async def _restore_required_virtual_orders(self):
         """
-        Restore virtual orders that would not be restored otherwise
-        Should only be called once or will create the same virtual orders multiple times
+        Restore virtual orders that would not be restored otherwise.
+        Virtual orders that are bound to an order group are restored from their group, which is why
+        grouped virtual orders' groups are restored as pending groups before completing them.
+        Orders that are already known to orders_manager are not restored again, making this call idempotent.
         """
         pending_groups = {}
         await orders_storage_operations.create_required_virtual_orders(
             pending_groups, self.channel.exchange_manager
         )
+        if pending_groups:
+            await orders_storage_operations.create_missing_virtual_orders_from_storage_order_groups(
+                pending_groups, self.channel.exchange_manager
+            )
 
     async def _handle_open_order_update(
         self, symbol, order_dict, exchange_order_id, is_from_bot, is_new_order, pending_groups

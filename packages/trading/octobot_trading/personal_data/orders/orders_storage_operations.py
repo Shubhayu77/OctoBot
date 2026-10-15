@@ -14,6 +14,7 @@
 #  You should have received a copy of the GNU Lesser General Public
 #  License along with this library.
 import octobot_commons.logging as logging
+import octobot_trading.constants as constants
 import octobot_trading.enums as enums
 import octobot_trading.personal_data.orders.order_factory as order_factory
 import octobot_trading.personal_data.orders.groups.group_util as group_util
@@ -59,11 +60,28 @@ async def create_order_from_storage_data(order_desc: dict, exchange_manager, pen
     return created_order
 
 
+def _is_order_already_restored(order_desc: dict, exchange_manager) -> bool:
+    """
+    :return: True when the order described by order_desc is already known to orders_manager.
+    Uses the stored order_id as this is the id that create_order_from_storage_data would restore it with.
+    """
+    order_id = order_desc.get(constants.STORAGE_ORIGIN_VALUE, {}).get(
+        enums.ExchangeConstantsOrderColumns.ID.value, None
+    )
+    if order_id is None:
+        return False
+    return exchange_manager.exchange_personal_data.orders_manager.has_order(order_id)
+
+
 async def _create_storage_virtual_orders_from_group(pending_group_id, exchange_manager, pending_groups):
     try:
         to_create_orders = exchange_manager.storage_manager.orders_storage \
             .get_startup_virtual_orders_details_from_group(pending_group_id)
         for order_desc in to_create_orders:
+            if _is_order_already_restored(order_desc, exchange_manager):
+                # order has already been restored (ex: by a previous group restore pass or from
+                # fetched exchange orders): don't create it twice
+                continue
             await create_order_from_storage_data(order_desc, exchange_manager, pending_groups)
     except Exception as err:
         logging.get_logger(LOGGER_NAME).exception(
@@ -88,6 +106,22 @@ async def create_required_virtual_orders(pending_groups, exchange_manager):
             )
         except Exception as err:
             logger.exception(err, True, f"Error when restoring virtual order order using stored data: {err}")
+    # grouped virtual orders are restored from their order group: register their groups as pending groups so that
+    # create_missing_virtual_orders_from_storage_order_groups can restore them.
+    # Required as, when every order of a group is virtual, no fetched exchange order is referring to this group,
+    # therefore it would never be registered as a pending group.
+    for order_details in virtual_orders:
+        if order_details.get(enums.StoredOrdersAttr.GROUP.value, {}) == {}:
+            continue
+        try:
+            if group := group_util.get_or_create_order_group_from_storage_order_details(
+                order_details, exchange_manager
+            ):
+                pending_groups[group.name] = group
+        except Exception as err:
+            logger.exception(
+                err, True, f"Error when restoring virtual order's order group using stored data: {err}"
+            )
 
 
 async def create_missing_virtual_orders_from_storage_order_groups(pending_groups, exchange_manager):
