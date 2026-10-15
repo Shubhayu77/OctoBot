@@ -13,6 +13,8 @@
 #
 #  You should have received a copy of the GNU Lesser General Public
 #  License along with this library.
+import copy
+import functools
 import mock
 import pytest
 import pytest_asyncio
@@ -179,6 +181,82 @@ async def test_create_required_virtual_orders_does_not_duplicate_already_restore
     assert len(orders_manager.orders) == 2
     assert orders_manager.get_order(STOP_ORDER_ID) is already_restored_stop
     assert orders_manager.has_order(TAKE_PROFIT_ORDER_ID)
+
+
+def _as_real_startup_orders_storage(mocked_order_storage, documents):
+    """
+    Bind the real OrdersStorage virtual orders selectors to mocked_order_storage so that the
+    real storage filtering logic is used, from documents as they are read back from database.
+    """
+    mocked_order_storage.startup_orders = {
+        document[constants.STORAGE_ORIGIN_VALUE][enums.ExchangeConstantsOrderColumns.ID.value]:
+            orders_storage.from_order_document(copy.deepcopy(document))
+        for document in documents
+    }
+    mocked_order_storage.get_all_virtual_startup_orders = functools.partial(
+        orders_storage.OrdersStorage.get_all_virtual_startup_orders, mocked_order_storage
+    )
+    mocked_order_storage.get_startup_virtual_orders_details_from_group = functools.partial(
+        orders_storage.OrdersStorage.get_startup_virtual_orders_details_from_group, mocked_order_storage
+    )
+
+
+async def test_restore_required_virtual_orders_restores_fully_virtual_group_on_startup(
+    initialized_mocked_order_storage
+):
+    """
+    SCRUM-5 regression: after a restart, a DailyTradingMode spot stop loss / take profit pair is
+    stored as a fully virtual OCO group (self-managed stop + inactive take profit) and no fetched
+    exchange order refers to that group. The startup restore must still rebuild both legs.
+    This drives the actual startup entry point: OrdersProducer._restore_required_virtual_orders.
+    """
+    mocked_order_storage, exchange_manager_inst, trader_inst = initialized_mocked_order_storage
+    orders_manager = exchange_manager_inst.exchange_personal_data.orders_manager
+    documents = _build_oco_group_virtual_order_documents(exchange_manager_inst, trader_inst)
+    _as_real_startup_orders_storage(mocked_order_storage, documents)
+    # nothing is restored yet and the group is gone: this is a fresh start
+    assert not orders_manager.orders
+    assert not orders_manager.order_groups
+
+    channel = mock.Mock(exchange_manager=exchange_manager_inst)
+    producer = personal_data.OrdersProducer(channel)
+    await producer._restore_required_virtual_orders()
+
+    # both legs of the fully virtual group are restored
+    assert sorted(orders_manager.orders) == sorted([STOP_ORDER_ID, TAKE_PROFIT_ORDER_ID])
+    restored_stop = orders_manager.get_order(STOP_ORDER_ID)
+    restored_take_profit = orders_manager.get_order(TAKE_PROFIT_ORDER_ID)
+    # both legs are bound to the same restored group instance, otherwise the OCO link is broken
+    assert isinstance(restored_stop.order_group, personal_data.OneCancelsTheOtherOrderGroup)
+    assert restored_stop.order_group is restored_take_profit.order_group
+    assert restored_stop.order_group is orders_manager.order_groups[GROUP_ID]
+    # the inactive leg must not be turned into a live exchange order
+    assert restored_take_profit.is_active is False
+    assert restored_stop.is_active is True
+    assert restored_stop.is_self_managed() is True
+
+
+async def test_restore_required_virtual_orders_is_idempotent(initialized_mocked_order_storage):
+    """
+    SCRUM-5 regression: the startup restore now also runs on the pending groups it collects itself,
+    it must therefore not duplicate orders that are already known to orders_manager.
+    """
+    mocked_order_storage, exchange_manager_inst, trader_inst = initialized_mocked_order_storage
+    orders_manager = exchange_manager_inst.exchange_personal_data.orders_manager
+    documents = _build_oco_group_virtual_order_documents(exchange_manager_inst, trader_inst)
+    _as_real_startup_orders_storage(mocked_order_storage, documents)
+
+    channel = mock.Mock(exchange_manager=exchange_manager_inst)
+    producer = personal_data.OrdersProducer(channel)
+    await producer._restore_required_virtual_orders()
+    assert sorted(orders_manager.orders) == sorted([STOP_ORDER_ID, TAKE_PROFIT_ORDER_ID])
+    first_restored_orders = dict(orders_manager.orders)
+
+    # a 2nd restore pass does not create any additional or replacement order
+    await producer._restore_required_virtual_orders()
+    assert orders_manager.orders == first_restored_orders
+    assert orders_manager.get_order(STOP_ORDER_ID) is first_restored_orders[STOP_ORDER_ID]
+    assert orders_manager.get_order(TAKE_PROFIT_ORDER_ID) is first_restored_orders[TAKE_PROFIT_ORDER_ID]
 
 
 async def test_apply_order_storage_details_if_any(initialized_mocked_order_storage):
