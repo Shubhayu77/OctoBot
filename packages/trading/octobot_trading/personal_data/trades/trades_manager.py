@@ -83,6 +83,10 @@ class TradesManager(util.Initializable):
                 f"{trade.symbol} at {trade.origin_price}"
             )
             return False
+        # invariant: the map key is always the trade's own trade_id. trade_id is the only identity that gets
+        # persisted (Trade.to_dict) and the only one the history is re-keyed by on reload (upsert_trade_instance),
+        # so letting the key and the trade identity diverge would make every reload re-import the same trades.
+        trade.trade_id = trade_id
         self.trades[trade_id] = trade
         self._check_trades_size()
         return True
