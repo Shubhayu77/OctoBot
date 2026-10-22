@@ -24,6 +24,7 @@ import octobot_trading.constants as constants
 import octobot_trading.enums as enums
 import octobot_trading.personal_data as personal_data
 import octobot_trading.personal_data.trades.trade_pnl as trade_pnl
+import octobot_trading.personal_data.trades.trades_util as trades_util
 import octobot_trading.util as util
 
 if typing.TYPE_CHECKING:
@@ -40,6 +41,9 @@ class TradesManager(util.Initializable):
         self.trader = trader
         self.trades_initialized: bool = False
         self.trades: collections.OrderedDict[str, personal_data.Trade] = collections.OrderedDict()
+        # identities of the stored trades, used to recognize an already stored trade that is
+        # keyed differently (ex: re-fetched from the exchange after being reloaded from storage)
+        self._known_trade_identities: set[tuple[str, str]] = set()
 
     async def initialize_impl(self):
         await self.reload_history(False)
@@ -54,13 +58,16 @@ class TradesManager(util.Initializable):
         await self._load_trades_history(reset)
 
     def upsert_trade(self, trade_id: str, raw_trade: dict) -> bool:
+        identity = trades_util.trade_identity_key(raw_trade)
+        if self._is_already_stored_trade(identity, trade_id):
+            return False
         if trade_id not in self.trades:
             try:
                 created_trade = personal_data.create_trade_instance_from_raw(self.trader, raw_trade)
                 if trade_id in self.trades:
                     self.logger.debug(f"Replacement of an existing trade: {self.trades[trade_id].to_dict()} "
                                     f"by {created_trade.to_dict()} on id: {trade_id}")
-                return self._add_trade_if_relevant(trade_id, created_trade)
+                return self._add_trade_if_relevant(trade_id, created_trade, identity)
             except Exception as err:
                 message = f"Unexpected error when parsing [{self.trader.exchange_manager.exchange_name}] trade"
                 # don't spam with errors, only log warnings
@@ -69,11 +76,32 @@ class TradesManager(util.Initializable):
         return False
 
     def upsert_trade_instance(self, trade) -> bool:
+        identity = trades_util.trade_identity_key(trade.to_dict())
+        if self._is_already_stored_trade(identity, trade.trade_id):
+            return False
         if trade.trade_id not in self.trades:
-            return self._add_trade_if_relevant(trade.trade_id, trade)
+            return self._add_trade_if_relevant(trade.trade_id, trade, identity)
         return False
 
-    def _add_trade_if_relevant(self, trade_id: str, trade) -> bool:
+    def _is_already_stored_trade(
+        self, identity: typing.Optional[tuple[str, str]], trade_id: typing.Optional[str]
+    ) -> bool:
+        """
+        Return True when a trade sharing this identity is already stored: the same exchange fill can
+        reach this manager under different keys (exchange order id when fetched, local trade id when
+        reloaded from storage), which would otherwise store it twice on every restart.
+        """
+        if identity is not None and identity in self._known_trade_identities:
+            self.logger.debug(
+                f"Ignored already stored [{self.trader.exchange_manager.exchange_name}] trade "
+                f"with identity {identity} (given id: {trade_id})"
+            )
+            return True
+        return False
+
+    def _add_trade_if_relevant(
+        self, trade_id: str, trade, identity: typing.Optional[tuple[str, str]] = None
+    ) -> bool:
         if (
             trade.status is enums.OrderStatus.CANCELED
             and not self.trader.exchange_manager.exchange_config.is_saving_cancelled_orders_as_trade
@@ -84,6 +112,10 @@ class TradesManager(util.Initializable):
             )
             return False
         self.trades[trade_id] = trade
+        if identity is not None:
+            # registered before _check_trades_size so that an immediately evicted trade
+            # also gets its identity discarded
+            self._known_trade_identities.add(identity)
         self._check_trades_size()
         return True
 
@@ -175,6 +207,7 @@ class TradesManager(util.Initializable):
     def _reset_trades(self):
         self.trades_initialized = False
         self.trades = collections.OrderedDict()
+        self._known_trade_identities = set()
 
     async def _load_trades_history(self, reset):
         if self.trader.exchange_manager.is_backtesting:
@@ -222,7 +255,12 @@ class TradesManager(util.Initializable):
         )
         popped = []
         for _ in range(nb_to_remove):
-            popped.append(self.trades.popitem(last=False)[1])
+            popped_trade = self.trades.popitem(last=False)[1]
+            popped.append(popped_trade)
+            # forget its identity so that this trade can be stored again if it is re-fetched
+            identity = trades_util.trade_identity_key(popped_trade.to_dict())
+            if identity is not None:
+                self._known_trade_identities.discard(identity)
         self.logger.info(
             f"Cleared the {len(popped)} {self.trader.exchange_manager.exchange_name} oldest historical trades: "
             f"{dict(self._get_trades_count_by_symbols(trades=popped))}"
