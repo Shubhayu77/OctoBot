@@ -19,14 +19,19 @@ import pytest
 
 from tests import event_loop
 from tests.exchanges import simulated_exchange_manager, simulated_trader
-from tests.personal_data.trades import create_trade
+from tests.personal_data.trades import (
+    TRADE_SYMBOL,
+    TRADE_TIME,
+    create_executed_trade,
+    create_raw_exchange_trade,
+    create_trade,
+)
 
 import octobot_trading.personal_data as personal_data
 import octobot_trading.enums as enums
 
 
 _ORDER_COLUMNS = enums.ExchangeConstantsOrderColumns
-_TRADE_TIME = 1502962946216
 
 
 @pytest.fixture
@@ -35,54 +40,30 @@ def trade_manager_and_trader(simulated_trader):
     return personal_data.TradesManager(trader_instance), trader_instance
 
 
-def _raw_exchange_trade(exchange_order_id, exchange_trade_id):
-    """
-    A trade dict shaped like the ones coming from the exchange: fix_trades drops the "id" key,
-    so the local trade id is generated anew on each parse and only the exchange ids are stable.
-    """
-    return {
-        _ORDER_COLUMNS.EXCHANGE_ID.value: exchange_order_id,
-        _ORDER_COLUMNS.EXCHANGE_TRADE_ID.value: exchange_trade_id,
-        _ORDER_COLUMNS.TIMESTAMP.value: _TRADE_TIME,
-        _ORDER_COLUMNS.SYMBOL.value: "BTC/USDT",
-        _ORDER_COLUMNS.TYPE.value: "limit",
-        _ORDER_COLUMNS.SIDE.value: "buy",
-        _ORDER_COLUMNS.TAKER_OR_MAKER.value: "taker",
-        _ORDER_COLUMNS.PRICE.value: 100.0,
-        _ORDER_COLUMNS.AMOUNT.value: 1.0,
-        _ORDER_COLUMNS.COST.value: 100.0,
-        _ORDER_COLUMNS.FEE.value: {
-            enums.FeePropertyColumns.COST.value: 0.1,
-            enums.FeePropertyColumns.CURRENCY.value: "USDT",
-            enums.FeePropertyColumns.RATE.value: 0.001,
-        },
-    }
-
-
 def _filled_trade(trader, origin_order_id, exchange_trade_id, associated_entry_ids=None):
-    trade = personal_data.Trade(trader)
+    trade = create_executed_trade(
+        trader,
+        enums.TradeOrderSide.BUY,
+        TRADE_TIME,
+        decimal.Decimal("1"),
+        decimal.Decimal("100"),
+        TRADE_SYMBOL,
+        {
+            enums.FeePropertyColumns.COST.value: decimal.Decimal("0.1"),
+            enums.FeePropertyColumns.CURRENCY.value: "USDT",
+        },
+    )
     trade.trade_id = origin_order_id
     trade.origin_order_id = origin_order_id
     trade.exchange_order_id = f"exchange-{origin_order_id}"
     trade.exchange_trade_id = exchange_trade_id
-    trade.symbol = "BTC/USDT"
     trade.currency = "BTC"
     trade.market = "USDT"
     trade.quantity_currency = "BTC"
     trade.status = enums.OrderStatus.FILLED
-    trade.side = enums.TradeOrderSide.BUY
-    trade.trade_type = enums.TraderOrderType.BUY_LIMIT
-    trade.exchange_trade_type = enums.TradeOrderType.LIMIT
     trade.taker_or_maker = "taker"
-    trade.creation_time = _TRADE_TIME
-    trade.executed_time = _TRADE_TIME
-    trade.executed_quantity = decimal.Decimal("1")
-    trade.executed_price = decimal.Decimal("100")
+    trade.creation_time = TRADE_TIME
     trade.total_cost = decimal.Decimal("100")
-    trade.fee = {
-        enums.FeePropertyColumns.COST.value: decimal.Decimal("0.1"),
-        enums.FeePropertyColumns.CURRENCY.value: "USDT",
-    }
     trade.associated_entry_ids = associated_entry_ids
     return trade
 
@@ -102,7 +83,7 @@ def _replay_restart(trade_manager, trader, raw_trades):
 
 def test_refetched_exchange_trade_is_not_duplicated_after_reload(trade_manager_and_trader):
     trade_manager, trader = trade_manager_and_trader
-    raw_trade = _raw_exchange_trade("exch-order-1", "exch-trade-1")
+    raw_trade = create_raw_exchange_trade("exch-order-1", "exch-trade-1")
 
     assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
     assert len(trade_manager.trades) == 1
@@ -115,7 +96,7 @@ def test_refetched_exchange_trade_is_not_duplicated_after_reload(trade_manager_a
 
 def test_refetched_exchange_trade_upsert_reports_no_change(trade_manager_and_trader):
     trade_manager, _ = trade_manager_and_trader
-    raw_trade = _raw_exchange_trade("exch-order-1", "exch-trade-1")
+    raw_trade = create_raw_exchange_trade("exch-order-1", "exch-trade-1")
 
     assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
     # same fill offered again: nothing changed, so no update is reported
@@ -126,7 +107,7 @@ def test_refetched_exchange_trade_upsert_reports_no_change(trade_manager_and_tra
 def test_evicted_trade_can_be_stored_again(trade_manager_and_trader):
     trade_manager, _ = trade_manager_and_trader
     trade_manager.MAX_TRADES_COUNT = 10
-    raw_trade = _raw_exchange_trade("exch-order-1", "exch-trade-1")
+    raw_trade = create_raw_exchange_trade("exch-order-1", "exch-trade-1")
     assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
 
     # evicting a trade must also forget its identity, otherwise it could never be re-fetched
@@ -143,7 +124,7 @@ def test_evicted_trade_without_exchange_trade_id_can_be_stored_again(trade_manag
     # id, which the parsed trade does not carry (it gets a generated local id instead). The
     # identity has to be forgotten as it was registered and never recomputed from the stored
     # trade, otherwise an evicted fill would be refused forever and identities would pile up.
-    raw_trade = _raw_exchange_trade("exch-order-1", None)
+    raw_trade = create_raw_exchange_trade("exch-order-1", None)
     assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
 
     trade_manager._remove_oldest_trades(1)
@@ -181,7 +162,7 @@ def test_pnl_survives_repeated_restarts(trade_manager_and_trader):
     assert len(trade_manager.get_completed_trades_pnl()) == 1
 
     raw_trades = [
-        _raw_exchange_trade(f"exch-order-{i}", f"exch-trade-{i}")
+        create_raw_exchange_trade(f"exch-order-{i}", f"exch-trade-{i}")
         for i in range(5)
     ]
     for _ in range(20):

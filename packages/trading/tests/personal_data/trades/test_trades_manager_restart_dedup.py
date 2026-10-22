@@ -31,39 +31,13 @@ import pytest
 
 from tests import event_loop
 from tests.exchanges import simulated_exchange_manager, simulated_trader
+from tests.personal_data.trades import TRADE_SYMBOL, TRADE_TIME, create_raw_exchange_trade
 
 import octobot_trading.enums as enums
 import octobot_trading.personal_data as personal_data
 
 
 _COLUMNS = enums.ExchangeConstantsOrderColumns
-_TRADE_TIME = 1502962946216
-_SYMBOL = "BTC/USDT"
-
-
-def _exchange_fill(exchange_order_id, exchange_trade_id, side="buy"):
-    """
-    A fill shaped exactly like what reaches the trades channel: AbstractAdapter.fix_trades pops
-    the ccxt "id" key into "exchange_trade_id", so there is never an "id" key on this path and
-    the local trade_id is generated anew by the trade factory on every parse.
-    """
-    return {
-        _COLUMNS.EXCHANGE_ID.value: exchange_order_id,
-        _COLUMNS.EXCHANGE_TRADE_ID.value: exchange_trade_id,
-        _COLUMNS.TIMESTAMP.value: _TRADE_TIME,
-        _COLUMNS.SYMBOL.value: _SYMBOL,
-        _COLUMNS.TYPE.value: enums.TradeOrderType.LIMIT.value,
-        _COLUMNS.SIDE.value: side,
-        _COLUMNS.TAKER_OR_MAKER.value: enums.ExchangeConstantsMarketPropertyColumns.TAKER.value,
-        _COLUMNS.PRICE.value: 100.0,
-        _COLUMNS.AMOUNT.value: 1.0,
-        _COLUMNS.COST.value: 100.0,
-        _COLUMNS.FEE.value: {
-            enums.FeePropertyColumns.COST.value: 0.1,
-            enums.FeePropertyColumns.CURRENCY.value: "USDT",
-            enums.FeePropertyColumns.RATE.value: 0.001,
-        },
-    }
 
 
 def _octobot_trade(trader, order_id, associated_entry_ids=None):
@@ -71,7 +45,7 @@ def _octobot_trade(trader, order_id, associated_entry_ids=None):
     order = personal_data.create_order_instance(
         trader,
         order_type=enums.TraderOrderType.BUY_LIMIT,
-        symbol=_SYMBOL,
+        symbol=TRADE_SYMBOL,
         current_price=decimal.Decimal("100"),
         quantity=decimal.Decimal("1"),
         price=decimal.Decimal("100"),
@@ -80,10 +54,10 @@ def _octobot_trade(trader, order_id, associated_entry_ids=None):
         filled_price=decimal.Decimal("100"),
         quantity_filled=decimal.Decimal("1"),
         total_cost=decimal.Decimal("100"),
-        timestamp=_TRADE_TIME,
+        timestamp=TRADE_TIME,
     )
-    order.creation_time = _TRADE_TIME
-    order.executed_time = _TRADE_TIME
+    order.creation_time = TRADE_TIME
+    order.executed_time = TRADE_TIME
     order.taker_or_maker = enums.ExchangeConstantsMarketPropertyColumns.TAKER.value
     order.fee = {
         enums.FeePropertyColumns.COST.value: decimal.Decimal("0.1"),
@@ -91,7 +65,7 @@ def _octobot_trade(trader, order_id, associated_entry_ids=None):
     }
     order.associated_entry_ids = associated_entry_ids
     order.status = enums.OrderStatus.FILLED
-    return personal_data.create_trade_from_order(order, executed_time=_TRADE_TIME)
+    return personal_data.create_trade_from_order(order, executed_time=TRADE_TIME)
 
 
 class _TradesDb:
@@ -133,7 +107,7 @@ async def _ingest_exchange_fills(exchange_manager, fills):
     for fill in fills:
         results.append(
             await exchange_manager.exchange_personal_data.handle_trade_update(
-                _SYMBOL,
+                TRADE_SYMBOL,
                 fill[_COLUMNS.EXCHANGE_ID.value],
                 dict(fill),
                 is_old_trade=True,
@@ -159,7 +133,7 @@ async def test_refetched_exchange_fills_do_not_accumulate_across_restarts(
 ):
     _, exchange_manager, _ = simulated_trader
     trades_manager = exchange_manager.exchange_personal_data.trades_manager
-    fills = [_exchange_fill(f"order-{i}", f"trade-{i}") for i in range(4)]
+    fills = [create_raw_exchange_trade(f"order-{i}", f"trade-{i}") for i in range(4)]
 
     assert await _ingest_exchange_fills(exchange_manager, fills) == [True] * len(fills)
     assert len(trades_manager.trades) == len(fills)
@@ -192,7 +166,7 @@ async def test_pnl_pairs_survive_restarts_that_would_overflow_the_history(
     assert trades_manager.upsert_trade_instance(close) is True
     assert len(trades_manager.get_completed_trades_pnl()) == 1
 
-    fills = [_exchange_fill(f"order-{i}", f"trade-{i}") for i in range(8)]
+    fills = [create_raw_exchange_trade(f"order-{i}", f"trade-{i}") for i in range(8)]
     await _ingest_exchange_fills(exchange_manager, fills)
 
     for _ in range(15):
@@ -208,7 +182,7 @@ async def test_pnl_pairs_survive_restarts_that_would_overflow_the_history(
 async def test_resent_identical_fill_is_not_reported_as_a_change(simulated_trader, trades_db):
     _, exchange_manager, _ = simulated_trader
     trades_manager = exchange_manager.exchange_personal_data.trades_manager
-    fill = _exchange_fill("order-1", "trade-1")
+    fill = create_raw_exchange_trade("order-1", "trade-1")
 
     assert await _ingest_exchange_fills(exchange_manager, [fill]) == [True]
     # the exchange re-sends the very same fill: nothing changed
@@ -221,7 +195,10 @@ async def test_partial_fills_of_one_order_are_kept_apart(simulated_trader, trade
     _, exchange_manager, _ = simulated_trader
     trades_manager = exchange_manager.exchange_personal_data.trades_manager
     # one order matched against two counterparties: same exchange order id, two trade ids
-    fills = [_exchange_fill("order-1", "trade-a"), _exchange_fill("order-1", "trade-b")]
+    fills = [
+        create_raw_exchange_trade("order-1", "trade-a"),
+        create_raw_exchange_trade("order-1", "trade-b"),
+    ]
 
     await _ingest_exchange_fills(exchange_manager, fills)
     for _ in range(3):
@@ -242,7 +219,7 @@ async def test_evicted_fill_without_exchange_trade_id_can_be_stored_again(
     """
     _, exchange_manager, _ = simulated_trader
     trades_manager = exchange_manager.exchange_personal_data.trades_manager
-    fill = _exchange_fill("order-1", None)
+    fill = create_raw_exchange_trade("order-1", None)
 
     assert await _ingest_exchange_fills(exchange_manager, [fill]) == [True]
     assert len(trades_manager.trades) == 1
