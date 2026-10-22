@@ -416,7 +416,7 @@ class ExchangePersonalData(util.Initializable):
     async def handle_trade_update(self, symbol, trade_id, trade,
                                   is_old_trade: bool = False, should_notify: bool = True):
         try:
-            changed: bool = self.trades_manager.upsert_trade(trade_id, trade)
+            changed: bool = await self.trades_manager.upsert_trade(trade_id, trade)
             if changed and should_notify:
                 updated_trade = self.trades_manager.get_trade(trade_id)
                 await self.handle_trade_update_notification(updated_trade, is_old_trade=is_old_trade)
