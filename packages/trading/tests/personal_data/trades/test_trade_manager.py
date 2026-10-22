@@ -136,6 +136,39 @@ def test_evicted_trade_can_be_stored_again(trade_manager_and_trader):
     assert len(trade_manager.trades) == 1
 
 
+def test_evicted_trade_without_exchange_trade_id_can_be_stored_again(trade_manager_and_trader):
+    trade_manager, _ = trade_manager_and_trader
+    trade_manager.MAX_TRADES_COUNT = 10
+    # some exchanges return no per-trade id: the identity then falls back to the exchange order
+    # id, which the parsed trade does not carry (it gets a generated local id instead). The
+    # identity has to be forgotten as it was registered and never recomputed from the stored
+    # trade, otherwise an evicted fill would be refused forever and identities would pile up.
+    raw_trade = _raw_exchange_trade("exch-order-1", None)
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+
+    trade_manager._remove_oldest_trades(1)
+    assert len(trade_manager.trades) == 0
+    # no identity is kept around for a trade that is no longer in the history
+    assert trade_manager._trade_identity_by_key == {}
+    assert trade_manager._trade_key_by_identity == {}
+
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+    assert len(trade_manager.trades) == 1
+
+
+def test_upsert_trade_instance_does_not_serialize_the_trade(trade_manager_and_trader):
+    trade_manager, trader = trade_manager_and_trader
+    # identities are read from the trade id attributes: serializing every reloaded trade just to
+    # derive a key is wasteful on a full history and raises on a partially initialized trade
+    trade = _filled_trade(trader, "entry-order-1", "entry-trade-1")
+    trade.exchange_trade_type = None
+    assert trade_manager.upsert_trade_instance(trade) is True
+    assert len(trade_manager.trades) == 1
+    # the very same trade offered again is still recognized
+    assert trade_manager.upsert_trade_instance(trade) is False
+    assert len(trade_manager.trades) == 1
+
+
 def test_pnl_survives_repeated_restarts(trade_manager_and_trader):
     trade_manager, trader = trade_manager_and_trader
     trade_manager.MAX_TRADES_COUNT = 10
