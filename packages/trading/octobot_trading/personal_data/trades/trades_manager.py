@@ -53,10 +53,11 @@ class TradesManager(util.Initializable):
         self._reset_trades()
         await self._load_trades_history(reset)
 
-    def upsert_trade(self, trade_id: str, raw_trade: dict) -> bool:
+    async def upsert_trade(self, trade_id: str, raw_trade: dict) -> bool:
         if trade_id not in self.trades:
             try:
                 created_trade = personal_data.create_trade_instance_from_raw(self.trader, raw_trade)
+                await self._restore_trade_identity_from_storage(created_trade)
                 if trade_id in self.trades:
                     self.logger.debug(f"Replacement of an existing trade: {self.trades[trade_id].to_dict()} "
                                     f"by {created_trade.to_dict()} on id: {trade_id}")
@@ -175,6 +176,47 @@ class TradesManager(util.Initializable):
     def _reset_trades(self):
         self.trades_initialized = False
         self.trades = collections.OrderedDict()
+
+    async def _restore_trade_identity_from_storage(self, trade) -> None:
+        """
+        Trades rebuilt from raw exchange data lose the local order identity that PNL pairing relies on:
+        associated_entry_ids is never part of raw exchange data and origin_order_id ends up holding the
+        exchange order id instead of this OctoBot's Order.order_id. Restore both from the stored order
+        details of the previous run when the related order is still known from storage.
+        """
+        if trade.associated_entry_ids or not trade.exchange_order_id:
+            # nothing to restore or no exchange order id to look stored order details up with
+            return
+        try:
+            orders_storage = self.trader.exchange_manager.storage_manager.orders_storage
+            # only real orders are stored
+            if orders_storage is None or not orders_storage.should_store_data():
+                return
+            order_details = await orders_storage.get_startup_order_details(trade.exchange_order_id)
+            if not order_details:
+                return
+            local_order_id = order_details.get(constants.STORAGE_ORIGIN_VALUE, {}).get(
+                enums.ExchangeConstantsOrderColumns.ID.value
+            )
+            if local_order_id:
+                # origin_order_id is what get_completed_trades_pnl identifies entries by
+                trade.origin_order_id = local_order_id
+                trade.trade_id = local_order_id
+            associated_entry_ids = order_details.get(enums.StoredOrdersAttr.ENTRIES.value)
+            if associated_entry_ids:
+                trade.associated_entry_ids = associated_entry_ids
+            if local_order_id or associated_entry_ids:
+                self.logger.debug(
+                    f"Restored identity of trade on exchange order id {trade.exchange_order_id} using stored "
+                    f"order details: order id: {trade.origin_order_id}, "
+                    f"associated entry ids: {trade.associated_entry_ids}"
+                )
+        except Exception as err:
+            # never prevent a trade from being registered because of a storage issue
+            self.logger.warning(
+                f"Error when restoring trade identity from stored order details: {err} "
+                f"(exchange order id: {trade.exchange_order_id})"
+            )
 
     async def _load_trades_history(self, reset):
         if self.trader.exchange_manager.is_backtesting:
