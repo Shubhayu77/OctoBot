@@ -13,20 +13,165 @@
 #
 #  You should have received a copy of the GNU Lesser General Public
 #  License along with this library.
+import decimal
+
 import pytest
 
 from tests import event_loop
 from tests.exchanges import simulated_exchange_manager, simulated_trader
-from tests.personal_data.trades import create_trade
+from tests.personal_data.trades import (
+    TRADE_SYMBOL,
+    TRADE_TIME,
+    create_executed_trade,
+    create_raw_exchange_trade,
+    create_trade,
+)
 
 import octobot_trading.personal_data as personal_data
 import octobot_trading.enums as enums
+
+
+_ORDER_COLUMNS = enums.ExchangeConstantsOrderColumns
 
 
 @pytest.fixture
 def trade_manager_and_trader(simulated_trader):
     _, _, trader_instance = simulated_trader
     return personal_data.TradesManager(trader_instance), trader_instance
+
+
+def _filled_trade(trader, origin_order_id, exchange_trade_id, associated_entry_ids=None):
+    trade = create_executed_trade(
+        trader,
+        enums.TradeOrderSide.BUY,
+        TRADE_TIME,
+        decimal.Decimal("1"),
+        decimal.Decimal("100"),
+        TRADE_SYMBOL,
+        {
+            enums.FeePropertyColumns.COST.value: decimal.Decimal("0.1"),
+            enums.FeePropertyColumns.CURRENCY.value: "USDT",
+        },
+    )
+    trade.trade_id = origin_order_id
+    trade.origin_order_id = origin_order_id
+    trade.exchange_order_id = f"exchange-{origin_order_id}"
+    trade.exchange_trade_id = exchange_trade_id
+    trade.currency = "BTC"
+    trade.market = "USDT"
+    trade.quantity_currency = "BTC"
+    trade.status = enums.OrderStatus.FILLED
+    trade.taker_or_maker = "taker"
+    trade.creation_time = TRADE_TIME
+    trade.total_cost = decimal.Decimal("100")
+    trade.associated_entry_ids = associated_entry_ids
+    return trade
+
+
+def _replay_restart(trade_manager, trader, raw_trades):
+    """
+    Replay one container restart: the saved history is reloaded from storage, then the same
+    fills are re-downloaded from the exchange.
+    """
+    stored_history = [trade.to_dict() for trade in trade_manager.trades.values()]
+    trade_manager._reset_trades()
+    for trade_dict in stored_history:
+        trade_manager.upsert_trade_instance(personal_data.Trade.from_dict(trader, trade_dict))
+    for raw_trade in raw_trades:
+        trade_manager.upsert_trade(raw_trade[_ORDER_COLUMNS.EXCHANGE_ID.value], raw_trade)
+
+
+def test_refetched_exchange_trade_is_not_duplicated_after_reload(trade_manager_and_trader):
+    trade_manager, trader = trade_manager_and_trader
+    raw_trade = create_raw_exchange_trade("exch-order-1", "exch-trade-1")
+
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+    assert len(trade_manager.trades) == 1
+
+    # the reloaded trade is keyed by its generated local id while the re-fetched twin is looked
+    # up by exchange order id: both are the same exchange fill and must be stored only once
+    _replay_restart(trade_manager, trader, [raw_trade])
+    assert len(trade_manager.trades) == 1
+
+
+def test_refetched_exchange_trade_upsert_reports_no_change(trade_manager_and_trader):
+    trade_manager, _ = trade_manager_and_trader
+    raw_trade = create_raw_exchange_trade("exch-order-1", "exch-trade-1")
+
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+    # same fill offered again: nothing changed, so no update is reported
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is False
+    assert len(trade_manager.trades) == 1
+
+
+def test_evicted_trade_can_be_stored_again(trade_manager_and_trader):
+    trade_manager, _ = trade_manager_and_trader
+    trade_manager.MAX_TRADES_COUNT = 10
+    raw_trade = create_raw_exchange_trade("exch-order-1", "exch-trade-1")
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+
+    # evicting a trade must also forget its identity, otherwise it could never be re-fetched
+    trade_manager._remove_oldest_trades(1)
+    assert len(trade_manager.trades) == 0
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+    assert len(trade_manager.trades) == 1
+
+
+def test_evicted_trade_without_exchange_trade_id_can_be_stored_again(trade_manager_and_trader):
+    trade_manager, _ = trade_manager_and_trader
+    trade_manager.MAX_TRADES_COUNT = 10
+    # some exchanges return no per-trade id: the identity then falls back to the exchange order
+    # id, which the parsed trade does not carry (it gets a generated local id instead). The
+    # identity has to be forgotten as it was registered and never recomputed from the stored
+    # trade, otherwise an evicted fill would be refused forever and identities would pile up.
+    raw_trade = create_raw_exchange_trade("exch-order-1", None)
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+
+    trade_manager._remove_oldest_trades(1)
+    assert len(trade_manager.trades) == 0
+    # no identity is kept around for a trade that is no longer in the history
+    assert trade_manager._trade_identity_by_key == {}
+    assert trade_manager._trade_key_by_identity == {}
+
+    assert trade_manager.upsert_trade("exch-order-1", raw_trade) is True
+    assert len(trade_manager.trades) == 1
+
+
+def test_upsert_trade_instance_does_not_serialize_the_trade(trade_manager_and_trader):
+    trade_manager, trader = trade_manager_and_trader
+    # identities are read from the trade id attributes: serializing every reloaded trade just to
+    # derive a key is wasteful on a full history and raises on a partially initialized trade
+    trade = _filled_trade(trader, "entry-order-1", "entry-trade-1")
+    trade.exchange_trade_type = None
+    assert trade_manager.upsert_trade_instance(trade) is True
+    assert len(trade_manager.trades) == 1
+    # the very same trade offered again is still recognized
+    assert trade_manager.upsert_trade_instance(trade) is False
+    assert len(trade_manager.trades) == 1
+
+
+def test_pnl_survives_repeated_restarts(trade_manager_and_trader):
+    trade_manager, trader = trade_manager_and_trader
+    trade_manager.MAX_TRADES_COUNT = 10
+    entry = _filled_trade(trader, "entry-order-1", "entry-trade-1")
+    closing = _filled_trade(
+        trader, "exit-order-1", "exit-trade-1", associated_entry_ids=["entry-order-1"]
+    )
+    assert trade_manager.upsert_trade_instance(entry) is True
+    assert trade_manager.upsert_trade_instance(closing) is True
+    assert len(trade_manager.get_completed_trades_pnl()) == 1
+
+    raw_trades = [
+        create_raw_exchange_trade(f"exch-order-{i}", f"exch-trade-{i}")
+        for i in range(5)
+    ]
+    for _ in range(20):
+        _replay_restart(trade_manager, trader, raw_trades)
+
+    # without deduplication, re-fetched copies grow past MAX_TRADES_COUNT on every restart and
+    # evict the oldest trades, which are the entry/exit pair the pnl is computed from
+    assert len(trade_manager.get_completed_trades_pnl()) == 1
+    assert len(trade_manager.trades) == len(raw_trades) + 2
 
 
 def test_has_closing_trade_with_exchange_order_id(trade_manager_and_trader):

@@ -24,6 +24,7 @@ import octobot_trading.constants as constants
 import octobot_trading.enums as enums
 import octobot_trading.personal_data as personal_data
 import octobot_trading.personal_data.trades.trade_pnl as trade_pnl
+import octobot_trading.personal_data.trades.trades_util as trades_util
 import octobot_trading.util as util
 
 if typing.TYPE_CHECKING:
@@ -40,6 +41,13 @@ class TradesManager(util.Initializable):
         self.trader = trader
         self.trades_initialized: bool = False
         self.trades: collections.OrderedDict[str, personal_data.Trade] = collections.OrderedDict()
+        # Identity of each stored trade, used to recognize an already stored trade that is keyed
+        # differently (ex: re-fetched from the exchange after being reloaded from storage).
+        # Stored as the two inverse views of the same mapping and never recomputed: the identity
+        # forgotten when a trade is evicted is exactly the one registered when it was stored, so
+        # an evicted trade can always be stored again whatever ids its exchange provides.
+        self._trade_identity_by_key: dict[str, tuple[str, str]] = {}
+        self._trade_key_by_identity: dict[tuple[str, str], str] = {}
 
     async def initialize_impl(self):
         await self.reload_history(False)
@@ -54,13 +62,16 @@ class TradesManager(util.Initializable):
         await self._load_trades_history(reset)
 
     def upsert_trade(self, trade_id: str, raw_trade: dict) -> bool:
+        identity = trades_util.trade_identity_key(raw_trade)
+        if self._is_already_stored_trade(identity, trade_id):
+            return False
         if trade_id not in self.trades:
             try:
                 created_trade = personal_data.create_trade_instance_from_raw(self.trader, raw_trade)
                 if trade_id in self.trades:
                     self.logger.debug(f"Replacement of an existing trade: {self.trades[trade_id].to_dict()} "
                                     f"by {created_trade.to_dict()} on id: {trade_id}")
-                return self._add_trade_if_relevant(trade_id, created_trade)
+                return self._add_trade_if_relevant(trade_id, created_trade, identity)
             except Exception as err:
                 message = f"Unexpected error when parsing [{self.trader.exchange_manager.exchange_name}] trade"
                 # don't spam with errors, only log warnings
@@ -69,11 +80,44 @@ class TradesManager(util.Initializable):
         return False
 
     def upsert_trade_instance(self, trade) -> bool:
+        identity = trades_util.trade_instance_identity_key(trade)
+        if self._is_already_stored_trade(identity, trade.trade_id):
+            return False
         if trade.trade_id not in self.trades:
-            return self._add_trade_if_relevant(trade.trade_id, trade)
+            return self._add_trade_if_relevant(trade.trade_id, trade, identity)
         return False
 
-    def _add_trade_if_relevant(self, trade_id: str, trade) -> bool:
+    def _is_already_stored_trade(
+        self, identity: typing.Optional[tuple[str, str]], trade_id: typing.Optional[str]
+    ) -> bool:
+        """
+        Return True when a trade sharing this identity is already stored: the same exchange fill can
+        reach this manager under different keys (exchange order id when fetched, local trade id when
+        reloaded from storage), which would otherwise store it twice on every restart.
+        """
+        if identity is not None and identity in self._trade_key_by_identity:
+            self.logger.debug(
+                f"Ignored already stored [{self.trader.exchange_manager.exchange_name}] trade "
+                f"with identity {identity} (given id: {trade_id})"
+            )
+            return True
+        return False
+
+    def _register_trade_identity(self, trade_id: str, identity: typing.Optional[tuple[str, str]]):
+        # a trade stored under an already used key replaces it: forget the previous identity
+        self._forget_trade_identity(trade_id)
+        if identity is not None:
+            self._trade_identity_by_key[trade_id] = identity
+            self._trade_key_by_identity[identity] = trade_id
+
+    def _forget_trade_identity(self, trade_id: str):
+        identity = self._trade_identity_by_key.pop(trade_id, None)
+        if identity is not None and self._trade_key_by_identity.get(identity) == trade_id:
+            self._trade_key_by_identity.pop(identity)
+
+    def _add_trade_if_relevant(
+        self, trade_id: str, trade, identity: typing.Optional[tuple[str, str]] = None
+    ) -> bool:
         if (
             trade.status is enums.OrderStatus.CANCELED
             and not self.trader.exchange_manager.exchange_config.is_saving_cancelled_orders_as_trade
@@ -84,6 +128,9 @@ class TradesManager(util.Initializable):
             )
             return False
         self.trades[trade_id] = trade
+        # registered before _check_trades_size so that an immediately evicted trade
+        # also gets its identity discarded
+        self._register_trade_identity(trade_id, identity)
         self._check_trades_size()
         return True
 
@@ -175,6 +222,8 @@ class TradesManager(util.Initializable):
     def _reset_trades(self):
         self.trades_initialized = False
         self.trades = collections.OrderedDict()
+        self._trade_identity_by_key = {}
+        self._trade_key_by_identity = {}
 
     async def _load_trades_history(self, reset):
         if self.trader.exchange_manager.is_backtesting:
@@ -222,7 +271,11 @@ class TradesManager(util.Initializable):
         )
         popped = []
         for _ in range(nb_to_remove):
-            popped.append(self.trades.popitem(last=False)[1])
+            popped_trade_id, popped_trade = self.trades.popitem(last=False)
+            popped.append(popped_trade)
+            # forget the identity that was registered for this exact key, so that this trade can
+            # be stored again if it is re-fetched and no stale identity is kept around
+            self._forget_trade_identity(popped_trade_id)
         self.logger.info(
             f"Cleared the {len(popped)} {self.trader.exchange_manager.exchange_name} oldest historical trades: "
             f"{dict(self._get_trades_count_by_symbols(trades=popped))}"

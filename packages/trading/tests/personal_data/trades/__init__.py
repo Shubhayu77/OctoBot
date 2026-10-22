@@ -17,6 +17,38 @@ import octobot_trading.personal_data as personal_data
 import octobot_trading.enums
 
 
+TRADE_SYMBOL = "BTC/USDT"
+TRADE_TIME = 1502962946216
+
+
+def create_raw_exchange_trade(exchange_order_id, exchange_trade_id):
+    """
+    A trade dict shaped the way one really arrives from an exchange: AbstractAdapter.fix_trades
+    pops the ccxt "id" key into EXCHANGE_TRADE_ID, so there is never an ID key on this path and
+    the local trade id is generated anew by the trade factory on every parse.
+    """
+    columns = octobot_trading.enums.ExchangeConstantsOrderColumns
+    fee_columns = octobot_trading.enums.FeePropertyColumns
+    return {
+        columns.EXCHANGE_ID.value: exchange_order_id,
+        columns.EXCHANGE_TRADE_ID.value: exchange_trade_id,
+        columns.TIMESTAMP.value: TRADE_TIME,
+        columns.SYMBOL.value: TRADE_SYMBOL,
+        columns.TYPE.value: octobot_trading.enums.TradeOrderType.LIMIT.value,
+        columns.SIDE.value: octobot_trading.enums.TradeOrderSide.BUY.value,
+        columns.TAKER_OR_MAKER.value:
+            octobot_trading.enums.ExchangeConstantsMarketPropertyColumns.TAKER.value,
+        columns.PRICE.value: 100.0,
+        columns.AMOUNT.value: 1.0,
+        columns.COST.value: 100.0,
+        columns.FEE.value: {
+            fee_columns.COST.value: 0.1,
+            fee_columns.CURRENCY.value: "USDT",
+            fee_columns.RATE.value: 0.001,
+        },
+    }
+
+
 def create_trade(trader, exchange_order_id, is_closing_order, origin_order_id):
     trade = personal_data.Trade(trader)
     trade.exchange_order_id = exchange_order_id

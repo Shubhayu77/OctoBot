@@ -43,6 +43,20 @@ def trade_identity_key(trade: dict) -> typing.Optional[tuple[str, str]]:
     return None
 
 
+def trade_instance_identity_key(trade: "personal_data.Trade") -> typing.Optional[tuple[str, str]]:
+    """
+    Same identity rule as trade_identity_key, applied to a Trade instance without serializing it.
+    Only reads the 3 id attributes that Trade.to_dict maps onto the columns the rule looks at, so
+    it is safe on a partially initialized trade and cheap enough to call on a full history reload.
+    """
+    order_columns = trading_enums.ExchangeConstantsOrderColumns
+    return trade_identity_key({
+        order_columns.EXCHANGE_TRADE_ID.value: trade.exchange_trade_id,
+        order_columns.ID.value: trade.trade_id,
+        order_columns.EXCHANGE_ID.value: trade.exchange_order_id,
+    })
+
+
 def merge_trades_deduped(existing_trades: list[dict], new_trades: list[dict]) -> list[dict]:
     merged_trades = [dict(trade) for trade in existing_trades]
     known_trade_keys: set[tuple[str, str]] = set()
